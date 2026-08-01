@@ -128,6 +128,25 @@ struct like_fn {
       // restore saved positions
       pattern_itr = last_pattern_itr;
       last_target_itr += bytes_in_utf8_byte(*last_target_itr);
+
+      // Backtracking always resumes at the literal following the saved multi-wildcard, so any
+      // target byte differing from that literal's first byte cannot begin a match and can be
+      // skipped without decoding it. This replaces a full character decode plus the escape /
+      // single-wildcard branch chain per candidate position with one byte compare, which is
+      // where nearly all of the time goes for the common '%literal%' shapes.
+      //
+      // The test is on the raw byte rather than the decoded character, which is both cheaper
+      // and safe: '_', '%' and a single-byte escape are all ASCII, so a decoded character can
+      // equal one of them only if its first byte does, and requiring a lead byte
+      // (is_begin_utf8_char) means a byte-wise search can only land on a character boundary.
+      // Any case this rejects merely falls back to the unskipped walk.
+      auto const next_byte = d_pattern.data()[last_pattern_itr.byte_offset()];
+      if (next_byte != single_wildcard && next_byte != multi_wildcard && next_byte != esc_char &&
+          is_begin_utf8_char(next_byte)) {
+        while (last_target_itr < target_end && *last_target_itr != next_byte) {
+          ++last_target_itr;
+        }
+      }
       target_itr = last_target_itr;
     }
     return result;
