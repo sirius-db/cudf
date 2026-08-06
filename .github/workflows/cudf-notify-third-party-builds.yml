@@ -1,0 +1,24 @@
+# Copy this file to sirius-db/cudf as:
+# .github/workflows/notify-third-party-builds.yml
+#
+# Requires org secret: THIRD_PARTY_BUILDS_DISPATCH_TOKEN
+# (fine-grained PAT with actions:write on sirius-db/third-party-builds)
+
+name: notify-third-party-builds
+
+on:
+  push:
+    branches: ['release/**']
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger cuDF build in third-party-builds
+        run: |
+          gh workflow run build-cudf.yml \
+            --repo sirius-db/third-party-builds \
+            --field ref=${{ github.sha }} \
+            --field branch=${{ github.ref_name }}
+        env:
+          GH_TOKEN: ${{ secrets.THIRD_PARTY_BUILDS_DISPATCH_TOKEN }}
