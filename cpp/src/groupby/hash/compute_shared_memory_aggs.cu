@@ -64,6 +64,68 @@ __device__ void calculate_columns_to_aggregate(cudf::size_type& col_start,
   }
 }
 
+/**
+ * @brief Number of replicas of the aggregation slots a block keeps in shared memory.
+ *
+ * Every input row atomically updates one slot per output column, so when a block sees only a
+ * handful of distinct groups its threads all collide on the same few slots. That is much more
+ * expensive than it looks: a shared memory `atomicAdd` on a 64-bit type is not a native
+ * instruction, it lowers to `ATOMS.CAST.SPIN` -- a lock/retry loop -- so contending threads
+ * spin rather than being serialized once by the hardware. Replicating the slots so that
+ * colliding threads land on different copies is what keeps that cost down.
+ *
+ * The replication factor used to be a fixed `32 / cardinality`, which gives a block of
+ * `GROUPBY_BLOCK_SIZE` threads only 32 slots to spread over, i.e. several threads of every warp
+ * still share one slot. Raising it until each *lane of a warp* has its own replica removes
+ * intra-warp contention entirely, and that is where the measured gain is: on a 4-group, 9-column
+ * aggregation over 200M rows, the whole groupby drops from 84.9 ms at a factor of 16 to 19.8 ms
+ * at a factor of 32, and is then flat out to a factor of 256. So the target is one replica per
+ * lane and no more.
+ *
+ * The room for those replicas is already paid for. The launch reserves enough shared memory for
+ * `GROUPBY_CARDINALITY_THRESHOLD` distinct groups, so a low-cardinality block leaves most of it
+ * idle while still paying its occupancy cost; this spends it instead.
+ *
+ * The factor is bounded so it can never do worse than the fixed rule did:
+ *  - it never exceeds what keeps every column resident at once, so the kernel still makes a
+ *    single pass over the input rows (an extra pass would re-read the whole input);
+ *  - it never grows so large that initializing and merging the slots costs more than the rows
+ *    themselves, which would hurt blocks that only see a few rows;
+ *  - it is never smaller than the previous fixed rule.
+ */
+__device__ cudf::size_type compute_replication_factor(
+  cudf::mutable_table_device_view output_values,
+  cudf::size_type num_cols,
+  cudf::size_type cardinality,
+  cudf::size_type total_agg_size,
+  cudf::size_type rows_per_block)
+{
+  auto const legacy_factor = cuda::std::max(32 / cardinality, 1);
+  // One replica per lane of a warp; past that no two threads of a warp can collide anyway.
+  if (legacy_factor >= cudf::detail::warp_size) { return legacy_factor; }
+
+  // Bytes each column needs per aggregation slot: the value plus its validity byte.
+  cudf::size_type bytes_per_location = num_cols;
+  for (auto col_idx = 0; col_idx < num_cols; ++col_idx) {
+    bytes_per_location += cudf::type_dispatcher<cudf::dispatch_storage_type>(
+      output_values.column(col_idx).type(), size_of_functor{});
+  }
+
+  // `calculate_columns_to_aggregate` rounds each of its two per-column allocations up to
+  // ALIGNMENT, costing at most 2 * (ALIGNMENT - 1) bytes per column. Budgeting for that here
+  // means any factor this returns still leaves every column resident for a single pass.
+  auto const slack = 2 * (ALIGNMENT - 1) * num_cols;
+  if (total_agg_size <= slack) { return legacy_factor; }
+  auto locations = (total_agg_size - slack) / bytes_per_location;
+
+  locations = cuda::std::min(locations, cudf::detail::warp_size * cardinality);
+  // Initializing and merging the slots is O(locations) work against O(rows_per_block) of real
+  // work, so keep the former a small fraction of the latter.
+  locations = cuda::std::min(locations, cuda::std::max(rows_per_block / 8, 1));
+
+  return cuda::std::max(locations / cardinality, legacy_factor);
+}
+
 // Each block initialize its own shared memory aggregation results
 __device__ void initialize_shmem_aggregations(cooperative_groups::thread_block const& block,
                                               cudf::size_type col_start,
@@ -184,16 +246,11 @@ CUDF_KERNEL void single_pass_shmem_aggs_kernel(cudf::size_type num_rows,
   auto const cardinality = block_cardinality[block.group_index().x];
   if (cardinality > GROUPBY_CARDINALITY_THRESHOLD or cardinality == 0) { return; }
 
-  auto constexpr min_shmem_agg_locations = 32;
-  auto const multiplication_factor       = min_shmem_agg_locations / cardinality;
-  auto const num_agg_locations           = cuda::std::max(multiplication_factor, 1) * cardinality;
-  auto const agg_location_offset =
-    multiplication_factor > 1 ? (block.thread_rank() % multiplication_factor) * cardinality : 0;
-
   auto const num_cols = output_values.num_columns();
 
   __shared__ cudf::size_type col_start;
   __shared__ cudf::size_type col_end;
+  __shared__ cudf::size_type multiplication_factor;
   extern __shared__ cuda::std::byte shmem_agg_storage[];
 
   cudf::size_type* shmem_agg_res_offsets =
@@ -204,12 +261,23 @@ CUDF_KERNEL void single_pass_shmem_aggs_kernel(cudf::size_type num_rows,
   if (block.thread_rank() == 0) {
     col_start = 0;
     col_end   = 0;
+    // Block-uniform, so compute it once here rather than redundantly in every thread.
+    multiplication_factor =
+      compute_replication_factor(output_values,
+                                 num_cols,
+                                 cardinality,
+                                 total_agg_size,
+                                 num_rows / static_cast<cudf::size_type>(gridDim.x));
   }
   // Workaround: use __syncthreads() instead of block.sync() throughout this
   // kernel. cooperative_groups::thread_block::sync() does not properly fence
   // shared memory on sm_120 with CUDA 13.2, causing init stores to be
   // invisible to subsequent phases.
   __syncthreads();
+
+  auto const num_agg_locations = multiplication_factor * cardinality;
+  auto const agg_location_offset =
+    multiplication_factor > 1 ? (block.thread_rank() % multiplication_factor) * cardinality : 0;
 
   while (col_end < num_cols) {
     __syncthreads();
