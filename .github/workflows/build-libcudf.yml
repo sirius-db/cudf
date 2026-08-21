@@ -1,0 +1,361 @@
+name: build-libcudf
+
+on:
+  pull_request: # build + test, no upload
+  push:
+    branches:
+      - main
+      - "release/**" # build + test + upload
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'SHA or tag to build (leave empty for branch HEAD)'
+        required: false
+      upload:
+        description: 'Upload to prefix.dev after successful tests'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }} # cancel existing runs on PRs but run on all `dev` and merge queue commits
+
+# minimal default for the whole workflow - no job here pushes commits, comments,
+# or otherwise needs write access to the repo; artifact upload/download isn't
+# gated by this block. Jobs inherit this unless they declare their own.
+permissions:
+  contents: read
+
+env:
+  # self-hosted runners' actions-runner install doesn't bundle Node 24 externals yet,
+  # which container-based jobs need to docker-exec JS actions (e.g. actions/checkout)
+  # inside the container - fails with "/__e/node24/bin/node: no such file or
+  # directory". We pull the actions-runner from ARC's upstream source and don't want
+  # to maintain a patched fork of it just for this, so fall back to Node 20 (which is
+  # present) until the upstream runner image ships Node 24 externals.
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+
+jobs:
+  setup:
+    runs-on: ubuntu-slim
+    outputs:
+      cuda-matrix: ${{ steps.set.outputs.cuda-matrix }}
+      rapids-image-tag: ${{ steps.set.outputs.rapids-image-tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - id: set
+        run: |
+          # CUDA versions should match the major.minor versions used in RAPIDS releases
+          # check https://github.com/rapidsai/cudf/actions/workflows/build.yaml find a release then see the values
+          # of the matrix under `cpp-build`
+          #
+          # "version" (major.minor) is what we pass to conda/rattler-build - recipe.yaml's
+          # cuda_version context already truncates RAPIDS_CUDA_VERSION to major.minor, so a
+          # patch digit there is never actually consumed.
+          #
+          # "docker_cuda_version" is the exact patch pin rapidsai/ci-conda publishes images
+          # for - check https://hub.docker.com/r/rapidsai/ci-conda/tags and match it to
+          # "version" above when bumping.
+          echo 'cuda-matrix=[{"version":"13.2","docker_cuda_version":"13.2.0","runner_os":"ubuntu-24.04"},{"version":"12.9","docker_cuda_version":"12.9.1","runner_os":"ubuntu-22.04"}]' >> $GITHUB_OUTPUT
+
+          # rapidsai/ci-conda images are tagged "<rapids-version>-cuda<...>-<linux>-py<...>[-<arch>]"
+          # - keep this in lockstep with the RAPIDS release this branch tracks (VERSION file).
+          echo "rapids-image-tag=$(cut -d. -f1-2 VERSION)" >> $GITHUB_OUTPUT
+
+  build:
+    name: build / cuda${{ matrix.cuda.version }} / ${{ matrix.arch.platform }}
+    needs: [setup]
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ${{ fromJSON(needs.setup.outputs.cuda-matrix) }}
+        arch:
+          - platform: linux-64
+            docker_arch: amd64
+            runner_label: cpu-xl
+          - platform: linux-aarch64
+            docker_arch: arm64
+            runner_label: arm-xl
+
+    runs-on: ${{ fromJSON(format('["self-hosted", "{0}", "{1}"]', matrix.cuda.runner_os, matrix.arch.runner_label)) }}
+    # rockylinux8 keeps the built libcudf packages' glibc requirement as low as RAPIDS'
+    # own builds (glibc 2.28), instead of inheriting the runner host OS's glibc
+    # (Ubuntu 22.04/24.04 -> 2.35/2.39), which would silently break `dlopen` on Rocky
+    # Linux and other older-glibc distros. Matches the same image RAPIDS uses for
+    # libcudf's own cpp-build job - see rapidsai/shared-workflows' conda-cpp-build.yaml.
+    container:
+      image: rapidsai/ci-conda:${{ needs.setup.outputs.rapids-image-tag }}-cuda${{ matrix.cuda.docker_cuda_version }}-rockylinux8-py3.11-${{ matrix.arch.docker_arch }}
+      # bind-mounts the IRSA projected token from the `dind` sidecar's own filesystem
+      # (confirmed present there via `kubectl describe pod` on a live cpu-xl runner -
+      # same path as the `runner` container, so no path-remap needed like the Node
+      # externals fix required) so sccache's AWS SDK credential chain inside the job
+      # container can actually find and read it.
+      volumes:
+        - /var/run/secrets/eks.amazonaws.com/serviceaccount:/var/run/secrets/eks.amazonaws.com/serviceaccount:ro
+    env:
+      # container: jobs don't inherit the runner pod's own environment - only the
+      # workflow's explicit env vars get passed through (same reason the Node
+      # externals bind-mount needed a separate fix; this is the env-var equivalent).
+      # These match the values set on the `runner`/`dind` containers in this scale
+      # set's AutoscalingRunnerSet manifest (sirius-gha-runners repo) - not secrets,
+      # just S3 bucket/region config and IRSA identity for the self-hosted sccache
+      # backend's AWS access.
+      SCCACHE_BUCKET: sirius-gha-runners-sccache
+      SCCACHE_REGION: us-east-2
+      SCCACHE_S3_USE_SSL: "true"
+      AWS_ROLE_ARN: arn:aws:iam::104530974932:role/production-builder-service-account-20260408175309139800000016
+      AWS_WEB_IDENTITY_TOKEN_FILE: /var/run/secrets/eks.amazonaws.com/serviceaccount/token
+      AWS_REGION: us-east-2
+      AWS_DEFAULT_REGION: us-east-2
+      AWS_STS_REGIONAL_ENDPOINTS: regional
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      # pixi/rattler-build are already installed in the rapidsai/ci-conda image
+      # (see https://github.com/rapidsai/ci-imgs/blob/main/ci-conda.Dockerfile), so we
+      # don't need the "Install pixi"/"Install rattler-build" steps anymore. This job's
+      # channel solve (-c rapidsai -c conda-forge) doesn't need prefix.dev auth - that's
+      # only needed by the "upload" job below, which still has it.
+
+      - name: Set PARALLEL_LEVEL
+        # size parallelism off available RAM, not core count: cpu-xl/arm-xl
+        # are compute-optimized (2 GB/vCPU) instead of the 4 GB/vCPU upstream
+        # rapidsai/cudf sizes its cpu16 runners for, so scaling off nproc
+        # alone oversubscribes memory for CUDA LTO compiles (see sirius-gha-runners
+        # CLAUDE.md's cpu-xl/arm-xl vCPU:RAM ratio note)
+        run: |
+          echo "PARALLEL_LEVEL=$(python3 -c '
+          import os
+          cpu = os.cpu_count()
+          mem_gb = 0
+          with open("/proc/meminfo") as f:
+              for line in f:
+                  if line.startswith("MemTotal:"):
+                      mem_gb = int(line.split()[1]) / 1024 / 1024
+                      break
+          # ~4 GB RAM per parallel CUDA compile job, matching upstream
+          print(max(1, min(cpu, int(mem_gb // 4))))
+          ')" >> $GITHUB_ENV
+
+      - name: Set RAPIDS_PACKAGE_VERSION and RAPIDS_DATE_STRING
+        run: |
+          echo "RAPIDS_PACKAGE_VERSION=$(cat VERSION | sed 's/\.00$/.0/')" >> $GITHUB_ENV
+          echo "RAPIDS_DATE_STRING=$(date +%y%m%d)" >> $GITHUB_ENV
+
+      - name: Configure sccache backend
+        run: |
+          if [[ -n "${SCCACHE_BUCKET}" ]]; then
+            echo "SCCACHE_BUCKET DEFINED -> Self Hosted Runner, Disable GHA sccache"
+            echo "SCCACHE_GHA_ENABLED=false" >> $GITHUB_ENV
+          else
+            echo "SCCACHE_BUCKET UNDEFINED -> GitHub Runner, Enable GHA sccache"
+            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+          fi
+          # set prefix to not clobber sirius-db/sirius cache
+          echo "SCCACHE_S3_KEY_PREFIX=cudf" >> $GITHUB_ENV
+
+      - name: Start sccache
+        run: sccache --start-server
+
+      - name: Build libcudf
+        env:
+          # env vars from https://github.com/rapidsai/cudf/blob/main/conda/recipes/libcudf/recipe.yaml
+          CMAKE_C_COMPILER_LAUNCHER: "sccache"
+          CMAKE_CUDA_COMPILER_LAUNCHER: "sccache"
+          CMAKE_CXX_COMPILER_LAUNCHER: "sccache"
+          CMAKE_GENERATOR: "Ninja"
+          CONDA_OVERRIDE_CUDA: "${{ matrix.cuda.version }}"
+          PARALLEL_LEVEL: "${{ env.PARALLEL_LEVEL }}"
+          RAPIDS_CONDA_ARCH: "${{ matrix.arch.platform == 'linux-64' && 'linux_64' || 'linux_aarch64' }}"
+          RAPIDS_CUDA_VERSION: "${{ matrix.cuda.version }}"
+          RAPIDS_DATE_STRING: "${{ env.RAPIDS_DATE_STRING }}"
+          RAPIDS_PACKAGE_VERSION: "${{ env.RAPIDS_PACKAGE_VERSION }}"
+        run: |
+          # flags from https://github.com/rapidsai/gha-tools/blob/main/tools/rapids-rattler-channel-string
+          rattler-build build \
+            --recipe conda/recipes/libcudf/recipe.yaml \
+            --target-platform ${{ matrix.arch.platform }} \
+            --experimental \
+            --no-build-id \
+            --channel-priority strict \
+            -c rapidsai \
+            -c conda-forge \
+            --output-dir output/
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: libcudf-${{ matrix.arch.platform }}-cuda${{ matrix.cuda.version }}
+          path: output/
+          if-no-files-found: error
+          retention-days: 3
+
+  test:
+    name: test / cuda${{ matrix.cuda.version }} / linux-64
+    needs: [build, setup]
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ${{ fromJSON(needs.setup.outputs.cuda-matrix) }} # gpu-l4 is amd64-only; aarch64 builds ship untested
+    # gpu-l4 (24 GB VRAM), not gpu-t4 (16 GB): some gtest suites (e.g. JOIN_TEST,
+    # PARQUET_TEST) need more than a T4 has - matches what upstream rapidsai/cudf
+    # itself uses for cpp tests (node_type: gpu-l4-latest-1 in their test.yaml).
+    # Host OS is hardcoded to ubuntu-24.04 (not matrix.cuda.runner_os, which is
+    # ubuntu-22.04 for the CUDA 12.9 line) because gpu-l4 only has a 24.04
+    # runner-scale-set in sirius-gha-runners - the host OS doesn't matter here
+    # anyway since everything actually runs inside the `container:` below.
+    runs-on: [self-hosted, ubuntu-24.04, gpu-l4]
+    timeout-minutes: 60
+    # matches the build job's image so the driver/CUDA userspace tooling (nvidia-smi,
+    # etc.) that our previous bare-runner test image lacked is actually present -
+    # these GPU runners run via a DinD sidecar with the NVIDIA container runtime
+    # configured, so `--gpus all` passes the host driver through to the container.
+    container:
+      image: rapidsai/ci-conda:${{ needs.setup.outputs.rapids-image-tag }}-cuda${{ matrix.cuda.docker_cuda_version }}-rockylinux8-py3.11-amd64
+      options: --gpus all
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: libcudf-linux-64-cuda${{ matrix.cuda.version }}
+          path: output/
+
+      # conda/mamba are already in the rapidsai/ci-conda image; no need to install
+      # pixi/micromamba separately anymore.
+
+      - name: Install libcudf-tests
+        # constrain cuda-version explicitly: the libcudf package string only encodes the
+        # CUDA major version (e.g. "cuda13"), so an unconstrained solve here can pull in a
+        # newer CUDA minor's runtime libs (e.g. 13.3) than what libcudf was actually built
+        # against (e.g. 13.2), causing cudaErrorInsufficientDriver at test time even when
+        # the driver is new enough for the CUDA line libcudf was built for.
+        #
+        # cmake (for ctest) is included explicitly: libcudf-tests's recipe has no
+        # cmake runtime dependency (it only ships compiled gtest binaries), so this
+        # fresh, isolated conda env doesn't inherit the base image's own cmake/ctest -
+        # ci/run_cudf_ctests.sh needs `ctest` on PATH inside this env.
+        run: |
+          mamba create -n libcudf-test -y \
+            --channel "file://$(pwd)/output" \
+            --channel rapidsai \
+            --channel conda-forge \
+            "cuda-version=${{ matrix.cuda.version }}" \
+            cmake \
+            libcudf-tests
+
+      - name: Run tests
+        # calls cudf's own ci/run_cudf_ctests.sh (already vendored in the checked-out
+        # source) instead of reimplementing test discovery/invocation ourselves - it
+        # runs `ctest` against CTestTestfile.cmake (the manifest CMake generates
+        # alongside the gtest binaries), rather than a naive directory glob that tries
+        # to execute every file it finds, including that non-executable manifest.
+        # $GITHUB_WORKSPACE is required (not a relative path): `conda run -n
+        # libcudf-test bash -c '...'` does not reliably preserve the invoking step's
+        # working directory.
+        run: |
+          nvidia-smi
+          conda run -n libcudf-test --no-capture-output bash -c '
+            set -eo pipefail
+            bash "$GITHUB_WORKSPACE/ci/run_cudf_ctests.sh" 2>&1 | tee /tmp/ctest.log
+          '
+
+      - name: Surface test failures
+        if: failure()
+        run: |
+          echo '## Test failures' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -h 'FAILED' /tmp/ctest.log | head -60 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  upload:
+    name: upload / cuda${{ matrix.cuda.version }} / ${{ matrix.arch.platform }}
+    needs: [setup, test]
+    if: |
+      needs.test.result == 'success' &&
+      (github.ref == 'refs/heads/main' ||
+       startsWith(github.ref, 'refs/heads/release/') ||
+       (github.event_name == 'workflow_dispatch' && inputs.upload == 'true'))
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ${{ fromJSON(needs.setup.outputs.cuda-matrix) }}
+        arch:
+          - platform: linux-64
+          - platform: linux-aarch64
+    runs-on: ubuntu-slim
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: libcudf-${{ matrix.arch.platform }}-cuda${{ matrix.cuda.version }}
+          path: output/
+
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
+        with:
+          pixi-version: latest
+          auth-host: prefix.dev
+          auth-token: "${{ secrets.PREFIX_DEV_TOKEN }}"
+          run-install: false
+
+      - name: Install rattler-build
+        run: pixi global install 'rattler-build>=0.55.0,<0.58'
+
+      - name: Upload to prefix.dev
+        # `rattler-build upload`'s package_files arg requires actual package file
+        # paths (validated by file extension) - it has no directory-recursion logic,
+        # so a bare `output/` directory has never been valid input here. This was
+        # only ever exercised now because `upload` needs `test` to succeed first, and
+        # `test` never passed until now - not a regression from anything we changed.
+        #
+        # Only upload the `libcudf` package itself, not the other outputs this
+        # recipe also builds (libcudf-tests, libcudf-example, libcudf_kafka) -
+        # libcudf-tests alone is ~2GB and we're tight on prefix.dev storage.
+        # Conda package filenames are `<name>-<version>-<build>.conda`, so
+        # `libcudf-[0-9]*.conda` matches only libcudf's own package (version starts
+        # with a digit) and excludes libcudf-tests-*/libcudf-example-* (next char is
+        # a letter) and libcudf_kafka-* (underscore, not dash, never matches at all).
+        run: |
+          rattler-build upload prefix \
+            --channel sirius-db/libcudf \
+            output/*/libcudf-[0-9]*.conda
+
+  libcudf:
+    runs-on: ubuntu-slim
+    needs: [setup, build, test, upload]
+    if: always()
+    steps:
+      - name: Check build matrix status
+        # upload is intentionally skipped on PR runs and pushes to non-main/release
+        # branches (see its own `if:` above) - `skipped` must not fail this gate,
+        # only an actual upload failure should.
+        if: |
+          needs.setup.result != 'success' ||
+          needs.build.result != 'success' ||
+          needs.test.result != 'success' ||
+          (needs.upload.result != 'success' && needs.upload.result != 'skipped')
+        run: exit 1
